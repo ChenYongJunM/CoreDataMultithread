@@ -1,0 +1,31 @@
+# CoreDataMultithread
+CoreData多线程操作分析：
+
+## 第一种： persistentStoreCoordinator<-mainContext<-privateContext     
+### 这种方式总共有两个Context，一个是UI线程中使用的mainContext，一个是子线程中使用的privateContext，
+他们的关系是privateContext.parentContext = mainContext，而mainContext是与Disk连接的Context，所以这种设计下，
+每当子线程privateContext进行save操作以后，它会将数据库所有变动Push up到其父Context，也就是mainContext中去，
+（注意：这时子线程的save操作并没有任何关于Disk IO的操作。） 而后mainContext在UI线程又要执行一次save操作才能真正将数据变动写进数据库中，这里的save操作就与Disk IO有关了，
+而且又是在主线程，所以说这种设计是最阻碍UI线程的。
+
+## 第二种： persistentStoreCoordinator<-backgroundContext<-mainContext<-privateContext    
+### 这种设计是第一种的改进设计，也是比较推荐的一种设计方式。它总共有三个Context，
+一是连接persistentStoreCoordinator也是最底层的backgroundContext，
+二是UI线程的mainContext，三是子线程的privateContext，后两个Context在第一种方式中已经介绍过了，
+这里就不再具体介绍，他们的关系是privateContext.parentContext = mainContext, mainContext.parentContext = backgroundContext。
+下面说说它的具体工作流程：在实际应用中，如果我们有API操作，首先我们会开一个子线程进行API请求，在得到Response后要进行数据库操作，
+这时我们要创建一个privateContext进行数据的增删改查，然后call privateContext的save方法进行存储，
+这里的save操作只是将所有数据变动Push up到它的父Context中也就是mainContext中，然后mainContext继续call save方法，
+将数据变动Push up到它的父Context中也就是backgroundContext，最后调用backgroundContext的save方法真正将数据变动存储到Disk数据库中，
+在这个过程中，前两个save操作相对耗时较少，真正耗时的操作是最后backgroundContext的save操作，
+因为只有它有Disk IO的操作。
+
+## 第三种：persistentStoreCoordinator<-mainContext     persistentStoreCoordinator<-privateContext     
+### 设计是最直观的一种设计，无论是mainContext还是privateContext都是连接persistentStoreCoordinator的。
+这种设计的工作流程是：首先在ViewController中要添加一个名为NSManagedObjectContextDidSaveNotification的通知 ，
+然后子线程中创建privateContext，进行数据增删改查操作，直接save到本地数据库，
+这时在ViewController中会回调之前注册的NSManagedObjectContextDidSaveNotification的回调方法，
+在该方法中调用mainContext的mergeChangesFromContextDidSaveNotification:notification方法，
+将所有的数据变动merge到mainContext中，这样就保持了两个Context中的数据同步。
+由于大部分的操作都是privateContext在子线程中操作的，所以这种设计是UI线程耗时最少的一种设计，
+但是它的代价是需要多写mergeChanges的方法。
